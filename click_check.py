@@ -394,11 +394,12 @@ def render_table(results: list[Result]) -> str:
     )
 
     headers = ["verdict", "target", "stat", "X-Frame-Options", "CSP frame-ancestors"]
-    rows: list[list[str]] = []
+    # Each cell is a list of visual lines so the target cell can stack
+    # annotations (→ final, ← resolved-from) on dim lines under the URL
+    # without bloating the column width.
+    rows: list[list[list[str]]] = []
     for r in rows_data:
-        target_cell = trunc(r.url or r.input, 55)
-        if r.resolved_from:
-            target_cell = target_cell + " " + c("← " + trunc(r.resolved_from, 35), "dim", "blue")
+        target_lines = [trunc(r.url or r.input, 70)]
         if r.final_url and r.url and r.final_url != r.url:
             req_origin = _origin(r.url)
             fin_origin = _origin(r.final_url)
@@ -406,7 +407,10 @@ def render_table(results: list[Result]) -> str:
                 tail = _origin(r.final_url) + (urlparse(r.final_url).path or "")
             else:
                 tail = urlparse(r.final_url).path or "/"
-            target_cell = target_cell + " " + c("→ " + trunc(tail, 45), "dim", "magenta")
+            target_lines.append(c("  → " + trunc(tail, 65), "dim", "magenta"))
+        if r.resolved_from:
+            target_lines.append(c("  ← " + trunc(r.resolved_from, 65), "dim", "blue"))
+
         if r.verdict == "error":
             xfo_cell = c(short_error(r.error or ""), "yellow")
             csp_cell = c("—", "dim")
@@ -428,29 +432,41 @@ def render_table(results: list[Result]) -> str:
                 stat_cell = c(str(r.status), "yellow")
             else:
                 stat_cell = c(str(r.status), "red")
-        rows.append([badge(r.verdict), target_cell, stat_cell, xfo_cell, csp_cell])
 
-    widths = [max(vlen(h), max((vlen(row[i]) for row in rows), default=0)) for i, h in enumerate(headers)]
+        rows.append([[badge(r.verdict)], target_lines, [stat_cell], [xfo_cell], [csp_cell]])
+
+    # Column widths: max vlen across header and every line of every cell
+    widths = [
+        max(
+            vlen(headers[i]),
+            max((vlen(line) for row in rows for line in row[i]), default=0),
+        )
+        for i in range(len(headers))
+    ]
     aligns = ["^", "<", ">", "<", "<"]
+    bar = c("│", "grey")
 
     def hr(left: str, mid: str, right: str, fill: str = "─") -> str:
         return c(left + mid.join(fill * (w + 2) for w in widths) + right, "grey")
 
-    def row(cells: list[str], style: Optional[str] = None) -> str:
-        bar = c("│", "grey")
-        body = bar + bar.join(
-            " " + vpad(cells[i] if not style else c(cells[i], style), widths[i], aligns[i]) + " "
-            for i in range(len(cells))
-        ) + bar
-        return body
+    def render_visual_row(cell_lines_per_col: list[list[str]], style: Optional[str] = None) -> list[str]:
+        height = max(len(cell) for cell in cell_lines_per_col)
+        out_lines: list[str] = []
+        for line_idx in range(height):
+            parts = []
+            for col_idx, cell in enumerate(cell_lines_per_col):
+                raw = cell[line_idx] if line_idx < len(cell) else ""
+                if style and raw:
+                    raw = c(raw, style)
+                parts.append(" " + vpad(raw, widths[col_idx], aligns[col_idx]) + " ")
+            out_lines.append(bar + bar.join(parts) + bar)
+        return out_lines
 
-    out = [
-        hr("┌", "┬", "┐"),
-        row(headers, style="bold"),
-        hr("├", "┼", "┤"),
-    ]
-    for cells in rows:
-        out.append(row(cells))
+    out = [hr("┌", "┬", "┐")]
+    out.extend(render_visual_row([[h] for h in headers], style="bold"))
+    out.append(hr("├", "┼", "┤"))
+    for row_cells in rows:
+        out.extend(render_visual_row(row_cells))
     out.append(hr("└", "┴", "┘"))
     return "\n".join(out)
 
