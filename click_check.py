@@ -96,17 +96,17 @@ def is_ip_literal(host: str) -> bool:
         return False
 
 
-def expand_with_resolved_ips(targets: list[str]) -> list[tuple[str, Optional[str]]]:
-    """For each domain target, also append synthetic IP targets from DNS.
+WorkItem = tuple[str, Optional[str]]  # (target_string, host_header)
 
-    Returns a list of (target_string, host_header_or_None). The host_header is
-    set on synthetic IP rows so virtual-hosted servers respond with the right
-    vhost when probed via IP.
-    """
-    out: list[tuple[str, Optional[str]]] = []
-    for t in targets:
-        out.append((t, None))
-        parsed = parse_target(t)
+
+def _expand_resolve(items: list[WorkItem]) -> list[WorkItem]:
+    """For each domain target without a host_header, append synthetic IP rows."""
+    out: list[WorkItem] = []
+    for target, host_header in items:
+        out.append((target, host_header))
+        if host_header is not None:
+            continue
+        parsed = parse_target(target)
         if parsed is None:
             continue
         forced_scheme, host, port, path = parsed
@@ -116,12 +116,11 @@ def expand_with_resolved_ips(targets: list[str]) -> list[tuple[str, Optional[str
             infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
         except socket.gaierror:
             continue
-        # Always pin scheme on synthesized IP targets — falling back to the
-        # other scheme on an IP behind a CDN (e.g. plain http on :443)
-        # produces meaningless 400-page results.
+        # Pin the scheme on synthesized IP rows: falling back to plain http
+        # on :443 against a CDN edge yields meaningless 400-page results.
         scheme = forced_scheme or initial_scheme(port)
         seen: set[str] = set()
-        for fam, _stype, _proto, _canon, sockaddr in infos:
+        for fam, _st, _proto, _c, sockaddr in infos:
             ip = sockaddr[0]
             if ip in seen:
                 continue
@@ -129,6 +128,39 @@ def expand_with_resolved_ips(targets: list[str]) -> list[tuple[str, Optional[str
             host_part = f"[{ip}]" if fam == socket.AF_INET6 else ip
             out.append((f"{scheme}://{host_part}:{port}{path}", host))
     return out
+
+
+def _expand_ptr(items: list[WorkItem]) -> list[WorkItem]:
+    """For each IP target without a host_header, look up PTR and append a
+    synthetic row that probes the same IP with Host: <ptr-name>."""
+    out: list[WorkItem] = []
+    for target, host_header in items:
+        out.append((target, host_header))
+        if host_header is not None:
+            continue
+        parsed = parse_target(target)
+        if parsed is None:
+            continue
+        _scheme, host, _port, _path = parsed
+        if not is_ip_literal(host):
+            continue
+        try:
+            ptr_name, _aliases, _addrs = socket.gethostbyaddr(host)
+        except (socket.herror, socket.gaierror, OSError):
+            continue
+        if not ptr_name or ptr_name == host:
+            continue
+        out.append((target, ptr_name))
+    return out
+
+
+def build_work_items(targets: list[str], do_resolve: bool, do_ptr: bool) -> list[WorkItem]:
+    items: list[WorkItem] = [(t, None) for t in targets]
+    if do_resolve:
+        items = _expand_resolve(items)
+    if do_ptr:
+        items = _expand_ptr(items)
+    return items
 
 
 def classify_xfo(value: Optional[str]) -> HeaderVerdict:
@@ -356,7 +388,10 @@ def progress_line(done: int, total: int, vuln: int, ok: int, err: int, width: in
 
 def render_table(results: list[Result]) -> str:
     rank = {"vulnerable": 0, "error": 1, "protected": 2}
-    rows_data = sorted(results, key=lambda r: (rank[r.verdict], r.input))
+    rows_data = sorted(
+        results,
+        key=lambda r: (rank[r.verdict], r.input, r.resolved_from is not None, r.resolved_from or ""),
+    )
 
     headers = ["verdict", "target", "stat", "X-Frame-Options", "CSP frame-ancestors"]
     rows: list[list[str]] = []
@@ -456,6 +491,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="For each domain target, also probe each resolved IP "
                          "(with Host: <domain> so vhosts respond correctly). "
                          "Use -k for HTTPS since cert won't match the IP.")
+    ap.add_argument("-P", "--ptr", action="store_true",
+                    help="For each IP target, do a PTR lookup and also probe "
+                         "the IP with Host: <ptr-hostname> set. Useful when "
+                         "forward DNS is dead but PTR records exist.")
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI color")
     args = ap.parse_args(argv)
 
@@ -477,7 +516,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("error: no targets in input file", file=sys.stderr)
         return 2
 
-    work = expand_with_resolved_ips(targets) if args.resolve else [(t, None) for t in targets]
+    work = build_work_items(targets, args.resolve, args.ptr)
 
     print(banner(len(work), args.workers, args.timeout, args.insecure))
 

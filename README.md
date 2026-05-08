@@ -5,7 +5,7 @@ Standalone Python 3 script that checks a list of `host:port` targets for clickja
 ## Usage
 
 ```
-python3 click_check.py targets.txt [-o results.json] [-w 20] [--timeout 10] [-k] [-R] [--no-follow]
+python3 click_check.py targets.txt [-o results.json] [-w 20] [--timeout 10] [-k] [-R] [-P] [--no-follow]
 ```
 
 - `targets.txt`: one target per line. Accepts:
@@ -15,7 +15,8 @@ python3 click_check.py targets.txt [-o results.json] [-w 20] [--timeout 10] [-k]
   - bare `host` (defaults to port 80)
 - Lines starting with `#`, blank lines, and inline `# comments` are stripped.
 - `-k / --insecure`: skip TLS verification (useful for internal IPs with self-signed certs).
-- `-R / --resolve`: also probe the resolved IP(s) for each domain target. The IP probe sends `Host: <original-domain>` so virtual-hosted servers respond with the right vhost. The IP row is annotated `← from <domain>` in the table. Use `-k` for HTTPS targets — TLS verification will fail because the cert won't match the IP literal, and CDN-fronted hosts (Cloudflare, etc.) often refuse SNI to an IP literal entirely; treat any TLS errors here as "the IP doesn't directly serve the app".
+- `-R / --resolve`: also probe the resolved IP(s) for each domain target. The IP probe sends `Host: <original-domain>` so virtual-hosted servers respond with the right vhost. The IP row is annotated `← <domain>` in the table. Use `-k` for HTTPS targets — TLS verification will fail because the cert won't match the IP literal, and CDN-fronted hosts (Cloudflare, etc.) often refuse SNI to an IP literal entirely; treat any TLS errors here as "the IP doesn't directly serve the app".
+- `-P / --ptr`: for each IP target, do a reverse-DNS (PTR) lookup and add a synthetic probe of the same IP with `Host: <ptr-hostname>` set. Useful when forward DNS is dead in the test environment but PTR records exist. `-R` and `-P` can be combined.
 - `--no-follow`: don't follow 3xx redirects; inspect headers on the exact URL.
 - By default redirects are followed and the **final** URL is the one inspected. When the final URL differs from the request, the table appends a dim `→ ...` indicator.
 - Exit code: `0` if no vulnerable targets, `1` if any vulnerable, `2` on usage error.
