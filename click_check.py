@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import ipaddress
 import json
 import re
 import shutil
@@ -13,7 +14,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -39,6 +40,7 @@ class Result:
     verdict: str  # vulnerable | protected | error
     scheme_used: Optional[str]
     error: Optional[str]
+    resolved_from: Optional[str] = None  # original domain when this row is a resolved IP
 
 
 def parse_target(line: str) -> Optional[tuple[Optional[str], str, int, str]]:
@@ -86,6 +88,49 @@ def _origin(url: str) -> str:
     return f"{p.scheme}://{p.hostname}:{port}"
 
 
+def is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def expand_with_resolved_ips(targets: list[str]) -> list[tuple[str, Optional[str]]]:
+    """For each domain target, also append synthetic IP targets from DNS.
+
+    Returns a list of (target_string, host_header_or_None). The host_header is
+    set on synthetic IP rows so virtual-hosted servers respond with the right
+    vhost when probed via IP.
+    """
+    out: list[tuple[str, Optional[str]]] = []
+    for t in targets:
+        out.append((t, None))
+        parsed = parse_target(t)
+        if parsed is None:
+            continue
+        forced_scheme, host, port, path = parsed
+        if is_ip_literal(host):
+            continue
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except socket.gaierror:
+            continue
+        # Always pin scheme on synthesized IP targets — falling back to the
+        # other scheme on an IP behind a CDN (e.g. plain http on :443)
+        # produces meaningless 400-page results.
+        scheme = forced_scheme or initial_scheme(port)
+        seen: set[str] = set()
+        for fam, _stype, _proto, _canon, sockaddr in infos:
+            ip = sockaddr[0]
+            if ip in seen:
+                continue
+            seen.add(ip)
+            host_part = f"[{ip}]" if fam == socket.AF_INET6 else ip
+            out.append((f"{scheme}://{host_part}:{port}{path}", host))
+    return out
+
+
 def classify_xfo(value: Optional[str]) -> HeaderVerdict:
     if value is None:
         return HeaderVerdict(None, "missing")
@@ -127,13 +172,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # signals "do not redirect"; original response is returned
 
 
-def fetch(url: str, timeout: float, insecure: bool, follow: bool) -> tuple[int, str, dict]:
+def fetch(url: str, timeout: float, insecure: bool, follow: bool,
+          host_header: Optional[str] = None) -> tuple[int, str, dict]:
     """Return (status, final_url, headers_dict_lower). Raises on failure."""
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": USER_AGENT, "Range": "bytes=0-0", "Accept": "*/*"},
-        method="GET",
-    )
+    req_headers = {"User-Agent": USER_AGENT, "Range": "bytes=0-0", "Accept": "*/*"}
+    if host_header:
+        req_headers["Host"] = host_header
+    req = urllib.request.Request(url, headers=req_headers, method="GET")
     ctx = ssl.create_default_context()
     if insecure:
         ctx.check_hostname = False
@@ -147,21 +192,23 @@ def fetch(url: str, timeout: float, insecure: bool, follow: bool) -> tuple[int, 
         return resp.status, resp.geturl(), headers
 
 
-def probe(target: str, timeout: float, insecure: bool, follow: bool = True) -> Result:
+def probe(target: str, timeout: float, insecure: bool, follow: bool = True,
+          host_header: Optional[str] = None) -> Result:
     parsed = parse_target(target)
     if parsed is None:
         return Result(target, None, None, None, asdict(HeaderVerdict(None, "missing")),
                       asdict(HeaderVerdict(None, "missing")),
                       asdict(HeaderVerdict(None, "missing")),
-                      "error", None, "could not parse target")
+                      "error", None, "could not parse target", resolved_from=host_header)
     forced_scheme, host, port, path = parsed
     schemes = [forced_scheme] if forced_scheme else [initial_scheme(port), "https" if initial_scheme(port) == "http" else "http"]
+    host_in_url = f"[{host}]" if ":" in host and not host.startswith("[") else host
 
     last_err: Optional[str] = None
     for scheme in schemes:
-        url = f"{scheme}://{host}:{port}{path}"
+        url = f"{scheme}://{host_in_url}:{port}{path}"
         try:
-            status, final_url, headers = fetch(url, timeout, insecure, follow)
+            status, final_url, headers = fetch(url, timeout, insecure, follow, host_header)
         except urllib.error.HTTPError as e:
             # HTTPError still carries headers; treat as a successful probe
             try:
@@ -190,13 +237,14 @@ def probe(target: str, timeout: float, insecure: bool, follow: bool = True) -> R
             verdict = "vulnerable"
 
         return Result(target, url, final_url, status, asdict(xfo), asdict(csp), asdict(csp_ro),
-                      verdict, scheme, None)
+                      verdict, scheme, None, resolved_from=host_header)
 
-    return Result(target, f"{schemes[0]}://{host}:{port}{path}", None, None,
+    return Result(target, f"{schemes[0]}://{host_in_url}:{port}{path}", None, None,
                   asdict(HeaderVerdict(None, "missing")),
                   asdict(HeaderVerdict(None, "missing")),
                   asdict(HeaderVerdict(None, "missing")),
-                  "error", None, last_err or "unreachable")
+                  "error", None, last_err or "unreachable",
+                  resolved_from=host_header)
 
 
 # ---------------- presentation layer ----------------
@@ -314,6 +362,8 @@ def render_table(results: list[Result]) -> str:
     rows: list[list[str]] = []
     for r in rows_data:
         target_cell = trunc(r.url or r.input, 55)
+        if r.resolved_from:
+            target_cell = target_cell + " " + c("← " + trunc(r.resolved_from, 35), "dim", "blue")
         if r.final_url and r.url and r.final_url != r.url:
             req_origin = _origin(r.url)
             fin_origin = _origin(r.final_url)
@@ -333,7 +383,16 @@ def render_table(results: list[Result]) -> str:
             csp_cell = (csp_v if csp_v is not None else c("— missing —", "red"))
             xfo_cell = trunc(xfo_cell, 40)
             csp_cell = trunc(csp_cell, 40)
-            stat_cell = str(r.status) if r.status is not None else c("—", "dim")
+            if r.status is None:
+                stat_cell = c("—", "dim")
+            elif 200 <= r.status < 300:
+                stat_cell = c(str(r.status), "green")
+            elif 300 <= r.status < 400:
+                stat_cell = c(str(r.status), "cyan")
+            elif 400 <= r.status < 500:
+                stat_cell = c(str(r.status), "yellow")
+            else:
+                stat_cell = c(str(r.status), "red")
         rows.append([badge(r.verdict), target_cell, stat_cell, xfo_cell, csp_cell])
 
     widths = [max(vlen(h), max((vlen(row[i]) for row in rows), default=0)) for i, h in enumerate(headers)]
@@ -393,6 +452,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("-k", "--insecure", action="store_true", help="Skip TLS verification")
     ap.add_argument("--no-follow", action="store_true",
                     help="Don't follow redirects; inspect headers on the exact URL")
+    ap.add_argument("-R", "--resolve", action="store_true",
+                    help="For each domain target, also probe each resolved IP "
+                         "(with Host: <domain> so vhosts respond correctly). "
+                         "Use -k for HTTPS since cert won't match the IP.")
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI color")
     args = ap.parse_args(argv)
 
@@ -414,7 +477,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("error: no targets in input file", file=sys.stderr)
         return 2
 
-    print(banner(len(targets), args.workers, args.timeout, args.insecure))
+    work = expand_with_resolved_ips(targets) if args.resolve else [(t, None) for t in targets]
+
+    print(banner(len(work), args.workers, args.timeout, args.insecure))
 
     results: list[Result] = []
     counts = {"vulnerable": 0, "protected": 0, "error": 0}
@@ -423,13 +488,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     term_w = shutil.get_terminal_size((100, 24)).columns
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = [ex.submit(probe, t, args.timeout, args.insecure, not args.no_follow) for t in targets]
+        futures = [ex.submit(probe, t, args.timeout, args.insecure, not args.no_follow, hh)
+                   for t, hh in work]
         for fut in concurrent.futures.as_completed(futures):
             r = fut.result()
             with lock:
                 results.append(r)
                 counts[r.verdict] += 1
-                line = progress_line(len(results), len(targets),
+                line = progress_line(len(results), len(work),
                                      counts["vulnerable"], counts["protected"], counts["error"])
                 if is_tty:
                     sys.stdout.write("\r" + line + " " * max(0, term_w - vlen(line) - 1))
