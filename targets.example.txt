@@ -1,0 +1,4 @@
+# One host:port (or scheme://host:port) per line. # and blank lines ignored.
+github.com:443
+example.com:443
+127.0.0.1:1

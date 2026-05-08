@@ -1,0 +1,7 @@
+targets.txt
+results.json
+results*.json
+__pycache__/
+*.pyc
+.venv/
+venv/
