@@ -1,4 +1,7 @@
-# One host:port (or scheme://host:port) per line. # and blank lines ignored.
+# One target per line. Accepts: host:port[/path], scheme://host:port[/path], host[/path].
+# # and blank lines are ignored.
 github.com:443
 example.com:443
+github.com:443/login          # redirects → final URL inspected
+http://neverssl.com           # plain-http app, useful sanity check
 127.0.0.1:1

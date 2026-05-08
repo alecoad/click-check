@@ -41,35 +41,49 @@ class Result:
     error: Optional[str]
 
 
-def parse_target(line: str) -> Optional[tuple[Optional[str], str, int]]:
-    """Return (forced_scheme, host, port) or None if unparseable."""
+def parse_target(line: str) -> Optional[tuple[Optional[str], str, int, str]]:
+    """Return (forced_scheme, host, port, path) or None if unparseable.
+
+    Accepts: scheme://host[:port][/path], host:port[/path], host[/path].
+    Path defaults to "/" when omitted; query string is preserved.
+    """
     line = line.strip()
     if not line or line.startswith("#"):
         return None
-    forced_scheme: Optional[str] = None
     if "://" in line:
         p = urlparse(line)
         if p.scheme not in ("http", "https") or not p.hostname:
             return None
-        forced_scheme = p.scheme
-        host = p.hostname
-        port = p.port or (443 if forced_scheme == "https" else 80)
-        return forced_scheme, host, port
-    if ":" in line and not line.endswith(":"):
-        host, _, port_str = line.rpartition(":")
+        port = p.port or (443 if p.scheme == "https" else 80)
+        path = p.path or "/"
+        if p.query:
+            path += "?" + p.query
+        return p.scheme, p.hostname, port, path
+    # No scheme: split path off first slash, then parse host[:port].
+    hostport, sep, path_rest = line.partition("/")
+    path = "/" + path_rest if sep else "/"
+    if ":" in hostport and not hostport.endswith(":"):
+        host, _, port_str = hostport.rpartition(":")
         try:
             port = int(port_str)
         except ValueError:
             return None
         if not host:
             return None
-        return None, host, port
-    # bare host
-    return None, line, 80
+        return None, host, port, path
+    if not hostport:
+        return None
+    return None, hostport, 80, path
 
 
 def initial_scheme(port: int) -> str:
     return "https" if port in HTTPS_PORTS else "http"
+
+
+def _origin(url: str) -> str:
+    p = urlparse(url)
+    port = p.port or (443 if p.scheme == "https" else 80)
+    return f"{p.scheme}://{p.hostname}:{port}"
 
 
 def classify_xfo(value: Optional[str]) -> HeaderVerdict:
@@ -108,7 +122,12 @@ def classify_csp(csp: Optional[str]) -> HeaderVerdict:
     return HeaderVerdict(raw, "missing")
 
 
-def fetch(url: str, timeout: float, insecure: bool) -> tuple[int, str, dict]:
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # signals "do not redirect"; original response is returned
+
+
+def fetch(url: str, timeout: float, insecure: bool, follow: bool) -> tuple[int, str, dict]:
     """Return (status, final_url, headers_dict_lower). Raises on failure."""
     req = urllib.request.Request(
         url,
@@ -119,26 +138,30 @@ def fetch(url: str, timeout: float, insecure: bool) -> tuple[int, str, dict]:
     if insecure:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+    handlers = [urllib.request.HTTPSHandler(context=ctx)]
+    if not follow:
+        handlers.append(_NoRedirect())
+    opener = urllib.request.build_opener(*handlers)
+    with opener.open(req, timeout=timeout) as resp:
         headers = {k.lower(): v for k, v in resp.headers.items()}
         return resp.status, resp.geturl(), headers
 
 
-def probe(target: str, timeout: float, insecure: bool) -> Result:
+def probe(target: str, timeout: float, insecure: bool, follow: bool = True) -> Result:
     parsed = parse_target(target)
     if parsed is None:
         return Result(target, None, None, None, asdict(HeaderVerdict(None, "missing")),
                       asdict(HeaderVerdict(None, "missing")),
                       asdict(HeaderVerdict(None, "missing")),
                       "error", None, "could not parse target")
-    forced_scheme, host, port = parsed
+    forced_scheme, host, port, path = parsed
     schemes = [forced_scheme] if forced_scheme else [initial_scheme(port), "https" if initial_scheme(port) == "http" else "http"]
 
     last_err: Optional[str] = None
     for scheme in schemes:
-        url = f"{scheme}://{host}:{port}/"
+        url = f"{scheme}://{host}:{port}{path}"
         try:
-            status, final_url, headers = fetch(url, timeout, insecure)
+            status, final_url, headers = fetch(url, timeout, insecure, follow)
         except urllib.error.HTTPError as e:
             # HTTPError still carries headers; treat as a successful probe
             try:
@@ -169,7 +192,7 @@ def probe(target: str, timeout: float, insecure: bool) -> Result:
         return Result(target, url, final_url, status, asdict(xfo), asdict(csp), asdict(csp_ro),
                       verdict, scheme, None)
 
-    return Result(target, f"{schemes[0]}://{host}:{port}/", None, None,
+    return Result(target, f"{schemes[0]}://{host}:{port}{path}", None, None,
                   asdict(HeaderVerdict(None, "missing")),
                   asdict(HeaderVerdict(None, "missing")),
                   asdict(HeaderVerdict(None, "missing")),
@@ -290,7 +313,15 @@ def render_table(results: list[Result]) -> str:
     headers = ["verdict", "target", "stat", "X-Frame-Options", "CSP frame-ancestors"]
     rows: list[list[str]] = []
     for r in rows_data:
-        url_display = r.final_url or r.url or r.input
+        target_cell = trunc(r.url or r.input, 55)
+        if r.final_url and r.url and r.final_url != r.url:
+            req_origin = _origin(r.url)
+            fin_origin = _origin(r.final_url)
+            if req_origin != fin_origin:
+                tail = _origin(r.final_url) + (urlparse(r.final_url).path or "")
+            else:
+                tail = urlparse(r.final_url).path or "/"
+            target_cell = target_cell + " " + c("→ " + trunc(tail, 45), "dim", "magenta")
         if r.verdict == "error":
             xfo_cell = c(short_error(r.error or ""), "yellow")
             csp_cell = c("—", "dim")
@@ -303,7 +334,7 @@ def render_table(results: list[Result]) -> str:
             xfo_cell = trunc(xfo_cell, 40)
             csp_cell = trunc(csp_cell, 40)
             stat_cell = str(r.status) if r.status is not None else c("—", "dim")
-        rows.append([badge(r.verdict), trunc(url_display, 50), stat_cell, xfo_cell, csp_cell])
+        rows.append([badge(r.verdict), target_cell, stat_cell, xfo_cell, csp_cell])
 
     widths = [max(vlen(h), max((vlen(row[i]) for row in rows), default=0)) for i, h in enumerate(headers)]
     aligns = ["^", "<", ">", "<", "<"]
@@ -360,6 +391,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("-w", "--workers", type=int, default=20, help="Concurrent workers (default: 20)")
     ap.add_argument("--timeout", type=float, default=10.0, help="Per-request timeout seconds (default: 10)")
     ap.add_argument("-k", "--insecure", action="store_true", help="Skip TLS verification")
+    ap.add_argument("--no-follow", action="store_true",
+                    help="Don't follow redirects; inspect headers on the exact URL")
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI color")
     args = ap.parse_args(argv)
 
@@ -368,7 +401,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         with open(args.targets_file) as f:
-            targets = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+            targets = []
+            for ln in f:
+                ln = ln.split("#", 1)[0].strip()  # strip inline + full-line comments
+                if ln:
+                    targets.append(ln)
     except OSError as e:
         print(f"error: cannot read {args.targets_file}: {e}", file=sys.stderr)
         return 2
@@ -386,7 +423,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     term_w = shutil.get_terminal_size((100, 24)).columns
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = [ex.submit(probe, t, args.timeout, args.insecure) for t in targets]
+        futures = [ex.submit(probe, t, args.timeout, args.insecure, not args.no_follow) for t in targets]
         for fut in concurrent.futures.as_completed(futures):
             r = fut.result()
             with lock:
