@@ -5,9 +5,12 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import re
+import shutil
 import socket
 import ssl
 import sys
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, asdict
@@ -173,25 +176,182 @@ def probe(target: str, timeout: float, insecure: bool) -> Result:
                   "error", None, last_err or "unreachable")
 
 
-def color(s: str, code: str, enabled: bool) -> str:
-    return f"\033[{code}m{s}\033[0m" if enabled else s
+# ---------------- presentation layer ----------------
+
+ANSI = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "magenta": "\033[35m",
+    "cyan": "\033[36m",
+    "grey": "\033[90m",
+    "badge_vuln": "\033[97;41;1m",
+    "badge_ok": "\033[30;42;1m",
+    "badge_err": "\033[30;43;1m",
+}
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+USE_COLOR = True
 
 
-def render(result: Result, use_color: bool) -> str:
-    if result.verdict == "vulnerable":
-        tag = color("[VULN]", "31;1", use_color)
-    elif result.verdict == "protected":
-        tag = color("[OK]  ", "32;1", use_color)
-    else:
-        tag = color("[ERR] ", "33;1", use_color)
+def c(s: str, *codes: str) -> str:
+    if not USE_COLOR or not codes:
+        return s
+    return "".join(ANSI[k] for k in codes) + s + ANSI["reset"]
 
-    url = result.final_url or result.url or result.input
-    if result.verdict == "error":
-        return f"{tag} {url:<45}  {result.error}"
-    xfo = result.xfo["value"] or "-"
-    csp = result.csp_frame_ancestors["value"] or "-"
-    return f"{tag} {url:<45}  XFO={xfo}  CSP={csp}"
 
+def vlen(s: str) -> int:
+    return len(_ANSI_RE.sub("", s))
+
+
+def vpad(s: str, w: int, align: str = "<") -> str:
+    pad = max(0, w - vlen(s))
+    if align == ">":
+        return " " * pad + s
+    if align == "^":
+        left = pad // 2
+        return " " * left + s + " " * (pad - left)
+    return s + " " * pad
+
+
+def trunc(s: str, w: int) -> str:
+    if len(s) <= w:
+        return s
+    return s[: max(0, w - 1)] + "…"
+
+
+def short_error(msg: str) -> str:
+    """Compress noisy urllib/socket error strings into a short human label."""
+    if not msg:
+        return "unreachable"
+    m = msg.lower()
+    if "connection refused" in m:
+        return "connection refused"
+    if "timed out" in m or "timeout" in m:
+        return "timeout"
+    if "name or service not known" in m or "nodename nor servname" in m or "name resolution" in m:
+        return "DNS resolution failed"
+    if "no route to host" in m:
+        return "no route to host"
+    if "network is unreachable" in m:
+        return "network unreachable"
+    if "certificate verify failed" in m or "certificate has expired" in m:
+        return "TLS verify failed"
+    if "ssl" in m or "tls" in m:
+        return "TLS error"
+    if "remote end closed connection" in m or "connection reset" in m:
+        return "connection reset"
+    return msg.split(":", 1)[-1].strip()[:60] or "error"
+
+
+def badge(verdict: str) -> str:
+    if verdict == "vulnerable":
+        return c(" VULN ", "badge_vuln")
+    if verdict == "protected":
+        return c("  OK  ", "badge_ok")
+    return c(" ERR  ", "badge_err")
+
+
+def banner(targets: int, workers: int, timeout: float, insecure: bool) -> str:
+    title = "  click-check  ·  clickjacking scanner  "
+    line = "═" * len(title)
+    out = [
+        c("╔" + line + "╗", "cyan"),
+        c("║", "cyan") + c(title, "bold", "cyan") + c("║", "cyan"),
+        c("╚" + line + "╝", "cyan"),
+        f"  {c('targets:', 'dim')} {targets}   "
+        f"{c('workers:', 'dim')} {workers}   "
+        f"{c('timeout:', 'dim')} {timeout:g}s   "
+        f"{c('tls-verify:', 'dim')} {'off' if insecure else 'on'}",
+        "",
+    ]
+    return "\n".join(out)
+
+
+def progress_line(done: int, total: int, vuln: int, ok: int, err: int, width: int = 28) -> str:
+    pct = done / total if total else 1.0
+    filled = int(round(pct * width))
+    bar = c("█" * filled, "cyan") + c("░" * (width - filled), "grey")
+    counts = (
+        f"{c(str(vuln), 'red')} vuln  "
+        f"{c(str(ok), 'green')} ok  "
+        f"{c(str(err), 'yellow')} err"
+    )
+    return f"  scanning  [{bar}] {done}/{total}   {counts}"
+
+
+def render_table(results: list[Result]) -> str:
+    rank = {"vulnerable": 0, "error": 1, "protected": 2}
+    rows_data = sorted(results, key=lambda r: (rank[r.verdict], r.input))
+
+    headers = ["verdict", "target", "stat", "X-Frame-Options", "CSP frame-ancestors"]
+    rows: list[list[str]] = []
+    for r in rows_data:
+        url_display = r.final_url or r.url or r.input
+        if r.verdict == "error":
+            xfo_cell = c(short_error(r.error or ""), "yellow")
+            csp_cell = c("—", "dim")
+            stat_cell = c("—", "dim")
+        else:
+            xfo_v = r.xfo["value"]
+            csp_v = r.csp_frame_ancestors["value"]
+            xfo_cell = (xfo_v if xfo_v is not None else c("— missing —", "red"))
+            csp_cell = (csp_v if csp_v is not None else c("— missing —", "red"))
+            xfo_cell = trunc(xfo_cell, 40)
+            csp_cell = trunc(csp_cell, 40)
+            stat_cell = str(r.status) if r.status is not None else c("—", "dim")
+        rows.append([badge(r.verdict), trunc(url_display, 50), stat_cell, xfo_cell, csp_cell])
+
+    widths = [max(vlen(h), max((vlen(row[i]) for row in rows), default=0)) for i, h in enumerate(headers)]
+    aligns = ["^", "<", ">", "<", "<"]
+
+    def hr(left: str, mid: str, right: str, fill: str = "─") -> str:
+        return c(left + mid.join(fill * (w + 2) for w in widths) + right, "grey")
+
+    def row(cells: list[str], style: Optional[str] = None) -> str:
+        bar = c("│", "grey")
+        body = bar + bar.join(
+            " " + vpad(cells[i] if not style else c(cells[i], style), widths[i], aligns[i]) + " "
+            for i in range(len(cells))
+        ) + bar
+        return body
+
+    out = [
+        hr("┌", "┬", "┐"),
+        row(headers, style="bold"),
+        hr("├", "┼", "┤"),
+    ]
+    for cells in rows:
+        out.append(row(cells))
+    out.append(hr("└", "┴", "┘"))
+    return "\n".join(out)
+
+
+def render_summary(results: list[Result], output_path: str) -> str:
+    vuln = sum(1 for r in results if r.verdict == "vulnerable")
+    ok = sum(1 for r in results if r.verdict == "protected")
+    err = sum(1 for r in results if r.verdict == "error")
+    total = len(results)
+
+    lines_data = [
+        (c("●", "red") + " " + c(f"{vuln} vulnerable", "red", "bold")),
+        (c("●", "green") + " " + c(f"{ok} protected", "green")),
+        (c("●", "yellow") + " " + c(f"{err} error{'s' if err != 1 else ''}", "yellow")),
+        c(f"total: {total}", "dim"),
+    ]
+    label = " summary "
+    inner = max(max(vlen(l) for l in lines_data), vlen(label) + 2, 28)
+    top = c("╭─" + label + "─" * (inner - vlen(label) + 1) + "╮", "cyan")
+    bot = c("╰" + "─" * (inner + 2) + "╯", "cyan")
+    body = [c("│", "cyan") + " " + vpad(l, inner) + " " + c("│", "cyan") for l in lines_data]
+    out = [top, *body, bot, "", c(f"results written to {output_path}", "dim")]
+    return "\n".join(out)
+
+
+# ---------------- CLI ----------------
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Check targets for clickjacking protections.")
@@ -202,6 +362,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("-k", "--insecure", action="store_true", help="Skip TLS verification")
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI color")
     args = ap.parse_args(argv)
+
+    global USE_COLOR
+    USE_COLOR = sys.stdout.isatty() and not args.no_color
 
     try:
         with open(args.targets_file) as f:
@@ -214,14 +377,36 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("error: no targets in input file", file=sys.stderr)
         return 2
 
-    use_color = sys.stdout.isatty() and not args.no_color
+    print(banner(len(targets), args.workers, args.timeout, args.insecure))
+
     results: list[Result] = []
+    counts = {"vulnerable": 0, "protected": 0, "error": 0}
+    lock = threading.Lock()
+    is_tty = sys.stdout.isatty()
+    term_w = shutil.get_terminal_size((100, 24)).columns
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = {ex.submit(probe, t, args.timeout, args.insecure): t for t in targets}
+        futures = [ex.submit(probe, t, args.timeout, args.insecure) for t in targets]
         for fut in concurrent.futures.as_completed(futures):
             r = fut.result()
-            results.append(r)
-            print(render(r, use_color), flush=True)
+            with lock:
+                results.append(r)
+                counts[r.verdict] += 1
+                line = progress_line(len(results), len(targets),
+                                     counts["vulnerable"], counts["protected"], counts["error"])
+                if is_tty:
+                    sys.stdout.write("\r" + line + " " * max(0, term_w - vlen(line) - 1))
+                    sys.stdout.flush()
+                else:
+                    print(line)
+
+    if is_tty:
+        sys.stdout.write("\r" + " " * (term_w - 1) + "\r")
+        sys.stdout.flush()
+    print()
+    print(render_table(results))
+    print()
+    print(render_summary(results, args.output))
 
     try:
         with open(args.output, "w") as f:
@@ -230,12 +415,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"error: cannot write {args.output}: {e}", file=sys.stderr)
         return 2
 
-    vuln = sum(1 for r in results if r.verdict == "vulnerable")
-    ok = sum(1 for r in results if r.verdict == "protected")
-    err = sum(1 for r in results if r.verdict == "error")
-    print(f"\n{vuln} vulnerable / {ok} protected / {err} errors out of {len(results)} targets")
-    print(f"results written to {args.output}")
-    return 1 if vuln else 0
+    return 1 if counts["vulnerable"] else 0
 
 
 if __name__ == "__main__":
